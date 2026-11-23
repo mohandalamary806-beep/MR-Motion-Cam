@@ -11,11 +11,15 @@ import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -29,6 +33,7 @@ import android.widget.TextView;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -66,6 +71,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private TextView sensitivityValue;
     private TextView smoothingValue;
     private TextView packetText;
+    private TextView netText;
     private Button startButton;
     private Button stopButton;
 
@@ -92,6 +98,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private final AtomicBoolean sendErrorShown = new AtomicBoolean(false);
     private volatile long packetsSent = 0;
     private volatile long sendAttempts = 0;
+    private volatile long sensorEvents = 0;
     private volatile String lastSendError = "";
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Runnable uiUpdater = new Runnable() {
@@ -100,7 +107,8 @@ public class MainActivity extends Activity implements SensorEventListener {
             pitchText.setText(String.format(Locale.US, "Pitch  %+.1f°", sentPitch));
             rollText.setText(String.format(Locale.US, "Roll  %+.1f°", sentRoll));
             String detail = lastSendError.isEmpty() ? "" : "\nآخر خطأ: " + lastSendError;
-            packetText.setText("Packets sent: " + packetsSent + " / Attempts: " + sendAttempts + detail);
+            packetText.setText("Packets sent: " + packetsSent + " / Attempts: " + sendAttempts
+                    + " / Sensor: " + sensorEvents + detail);
             mainHandler.postDelayed(this, 120);
         }
     };
@@ -117,6 +125,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         buildInterface();
         loadPreferences();
         updateSensorAvailability();
+        refreshNetworkInfo();
         mainHandler.post(uiUpdater);
     }
 
@@ -177,6 +186,12 @@ public class MainActivity extends Activity implements SensorEventListener {
         packetText.setTextSize(12);
         packetText.setPadding(0, dp(5), 0, 0);
         statusCard.addView(packetText);
+
+        netText = new TextView(this);
+        netText.setTextColor(muted);
+        netText.setTextSize(12);
+        netText.setPadding(0, dp(5), 0, 0);
+        statusCard.addView(netText);
 
         addSectionTitle(page, "اتصال الكمبيوتر", text);
         LinearLayout connectionCard = card(panel);
@@ -327,12 +342,18 @@ public class MainActivity extends Activity implements SensorEventListener {
         invertPitchSwitch.setOnCheckedChangeListener((buttonView, checked) -> invertPitch = checked);
 
         TextView footer = new TextView(this);
-        footer.setText("مهم: الموبايل والكمبيوتر لازم يكونوا على نفس شبكة Wi‑Fi. التطبيق يرسل زوايا الدوران فقط في هذا الإصدار.");
+        footer.setText("مهم: الموبايل والكمبيوتر لازم يكونوا على نفس شبكة Wi‑Fi. التطبيق يرسل زوايا الدوران فقط. الإرسال UDP بدون تأكيد استلام، فالتطبيق مش بيعرف لو الكمبيوتر استلم — راجع الأرقام في OpenTrack.");
         footer.setTextColor(muted);
         footer.setTextSize(12);
         footer.setGravity(Gravity.CENTER);
         footer.setPadding(dp(8), dp(18), dp(8), dp(4));
         page.addView(footer);
+
+        ipInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { }
+            @Override public void afterTextChanged(Editable s) { refreshNetworkInfo(); }
+        });
 
         setContentView(scroll);
     }
@@ -428,37 +449,51 @@ public class MainActivity extends Activity implements SensorEventListener {
             setStatus("المستشعر غير متاح على هذا الهاتف", true);
             return;
         }
-        String host = ipInput.getText().toString().trim();
+        String host = cleanIp(ipInput.getText().toString());
         String portString = portInput.getText().toString().trim();
         if (host.isEmpty()) {
             ipInput.setError("اكتب IP الكمبيوتر");
             return;
         }
+        byte[] ipBytes = parseIpv4(host);
+        if (ipBytes == null) {
+            ipInput.setError("IPv4 غير صحيح");
+            setStatus("اكتب IP الكمبيوتر بالشكل 192.168.1.5 (من ipconfig على الكمبيوتر)", true);
+            return;
+        }
+        if ((ipBytes[0] & 0xFF) == 127 || (ipBytes[0] == 0 && ipBytes[1] == 0 && ipBytes[2] == 0 && ipBytes[3] == 0)) {
+            ipInput.setError("ده عنوان الموبايل نفسه");
+            setStatus("127.0.0.1 / 0.0.0.0 معناه الموبايل نفسه! اكتب IP الكمبيوتر على الـ Wi-Fi (من ipconfig).", true);
+            return;
+        }
+        if (!host.equals(ipInput.getText().toString())) ipInput.setText(host);
         int port;
         try {
             port = Integer.parseInt(portString.isEmpty() ? String.valueOf(DEFAULT_PORT) : portString);
             if (port < 1 || port > 65535) throw new NumberFormatException();
-            destination = InetAddress.getByName(host);
+            // getByAddress with raw bytes never does a DNS lookup (a lookup on the UI thread would crash).
+            destination = InetAddress.getByAddress(ipBytes);
         } catch (Exception e) {
             portInput.setError("Port غير صحيح");
-            setStatus("راجع عنوان IP والـ Port", true);
+            setStatus("راجع الـ Port (الافتراضي 4242)", true);
             return;
         }
 
         destinationPort = port;
         savePreferences();
         stopSenderOnly();
+        String route;
         try {
             socket = new DatagramSocket();
-            wifiNetwork = findWifiNetwork();
-            if (wifiNetwork == null) {
-                socket.close();
-                socket = null;
-                setStatus("لم يتم العثور على شبكة Wi-Fi متصلة. وصل الموبايل بنفس شبكة الكمبيوتر.", true);
-                return;
+            wifiNetwork = findLanNetwork();
+            if (wifiNetwork != null) {
+                // Force UDP through the real Wi-Fi/Ethernet link, even with mobile data or a VPN running.
+                wifiNetwork.bindSocket(socket);
+                route = "عبر Wi-Fi";
+            } else {
+                // Phone is the hotspot, USB tethering, or no client Wi-Fi: fall back to normal routing.
+                route = "عبر المسار الافتراضي (مفيش Wi-Fi متصل)";
             }
-            // Force UDP traffic through Wi-Fi, even when mobile data is enabled.
-            wifiNetwork.bindSocket(socket);
         } catch (Exception e) {
             if (socket != null) {
                 socket.close();
@@ -473,6 +508,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         tracking = true;
         packetsSent = 0;
         sendAttempts = 0;
+        sensorEvents = 0;
         lastSendError = "";
         sentYaw = sentPitch = sentRoll = 0;
         sendErrorShown.set(false);
@@ -491,18 +527,112 @@ public class MainActivity extends Activity implements SensorEventListener {
                 mainHandler.post(() -> setStatus("توقف مرسل UDP: " + lastSendError, true));
             }
         }, 0, 16, TimeUnit.MILLISECONDS);
-        setStatus("●  إرسال عبر Wi-Fi إلى " + destination.getHostAddress() + ":" + destinationPort, false);
+        setStatus("●  إرسال " + route + " إلى " + destination.getHostAddress() + ":" + destinationPort, false);
+        refreshNetworkInfo();
     }
 
-    private Network findWifiNetwork() {
+    /**
+     * Picks the physical Wi-Fi (or Ethernet) network. VPN networks are skipped on purpose: a VPN running
+     * over Wi-Fi also reports TRANSPORT_WIFI, and binding to it would push LAN packets into the tunnel.
+     */
+    private Network findLanNetwork() {
         if (connectivityManager == null) return null;
+        Network ethernet = null;
         for (Network network : connectivityManager.getAllNetworks()) {
             NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(network);
-            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                return network;
-            }
+            if (caps == null || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue;
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return network;
+            if (ethernet == null && caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) ethernet = network;
+        }
+        return ethernet;
+    }
+
+    private LinkAddress phoneIpv4(Network network) {
+        if (network == null || connectivityManager == null) return null;
+        LinkProperties lp = connectivityManager.getLinkProperties(network);
+        if (lp == null) return null;
+        for (LinkAddress la : lp.getLinkAddresses()) {
+            if (la.getAddress() instanceof Inet4Address) return la;
         }
         return null;
+    }
+
+    /** Shows the phone's own IP and whether the typed PC address is on the same subnet. */
+    private void refreshNetworkInfo() {
+        if (netText == null || ipInput == null) return;
+        int ok = Color.rgb(53, 197, 180);
+        int warn = Color.rgb(255, 173, 95);
+        LinkAddress phone = phoneIpv4(findLanNetwork());
+        if (phone == null) {
+            netText.setText("الشبكة: مفيش Wi-Fi متصل (أو الموبايل hotspot / كابل)");
+            netText.setTextColor(warn);
+            return;
+        }
+        byte[] phoneIp = phone.getAddress().getAddress();
+        String msg = "IP الموبايل: " + phone.getAddress().getHostAddress() + "/" + phone.getPrefixLength();
+        int color = Color.rgb(151, 167, 180);
+        byte[] target = parseIpv4(cleanIp(ipInput.getText().toString()));
+        if (target != null) {
+            if ((target[0] & 0xFF) == 127) {
+                msg += "\n⚠ 127.0.0.1 معناه الموبايل نفسه — اكتب IP الكمبيوتر";
+                color = warn;
+            } else if (sameSubnet(phoneIp, target, phone.getPrefixLength())) {
+                msg += "\n✔ الكمبيوتر على نفس شبكة الموبايل";
+                color = ok;
+            } else {
+                msg += "\n⚠ الكمبيوتر مش على نفس شبكة الموبايل. أول 3 أرقام لازم تتشابه (مثلاً 192.168.1.x)."
+                        + " غالبًا واخد IP كرت افتراضي (VirtualBox / WSL / VPN) — خُد IP كرت الـ Wi-Fi.";
+                color = warn;
+            }
+        }
+        netText.setText(msg);
+        netText.setTextColor(color);
+    }
+
+    private boolean sameSubnet(byte[] a, byte[] b, int prefix) {
+        if (a.length != 4 || b.length != 4) return false;
+        int full = Math.min(prefix / 8, 4);
+        for (int i = 0; i < full; i++) if (a[i] != b[i]) return false;
+        int rem = prefix % 8;
+        if (rem > 0 && full < 4) {
+            int mask = (0xFF << (8 - rem)) & 0xFF;
+            if ((a[full] & mask) != (b[full] & mask)) return false;
+        }
+        return true;
+    }
+
+    /** Turns what the user typed into plain ASCII: Arabic-Indic digits, Arabic dots/commas, RTL marks, spaces. */
+    private String cleanIp(String raw) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            int digit = Character.digit(c, 10);
+            if (digit >= 0) {
+                sb.append((char) ('0' + digit));
+            } else if (c == '.' || c == ',' || c == '\u066B' || c == '\u060C' || c == '\u06D4' || c == '\u3002') {
+                sb.append('.');
+            } else if (!Character.isWhitespace(c) && Character.getType(c) != Character.FORMAT) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    private byte[] parseIpv4(String value) {
+        String[] parts = value.split("\\.", -1);
+        if (parts.length != 4) return null;
+        byte[] out = new byte[4];
+        for (int i = 0; i < 4; i++) {
+            String part = parts[i];
+            if (part.isEmpty() || part.length() > 3) return null;
+            for (int k = 0; k < part.length(); k++) {
+                if (part.charAt(k) < '0' || part.charAt(k) > '9') return null;
+            }
+            int n = Integer.parseInt(part);
+            if (n > 255) return null;
+            out[i] = (byte) n;
+        }
+        return out;
     }
 
     private void stopTracking(String message) {
@@ -586,6 +716,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     @Override
     public void onSensorChanged(SensorEvent event) {
         if (event.sensor.getType() != Sensor.TYPE_ROTATION_VECTOR) return;
+        sensorEvents++;
         float[] rotationMatrix = new float[9];
         float[] orientation = new float[3];
         SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
@@ -600,6 +731,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     @Override
     protected void onResume() {
         super.onResume();
+        refreshNetworkInfo();
         if (tracking && rotationSensor != null && !sensorRegistered) {
             sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_GAME);
             sensorRegistered = true;
