@@ -10,6 +10,9 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -46,6 +49,8 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private SensorManager sensorManager;
     private Sensor rotationSensor;
+    private ConnectivityManager connectivityManager;
+    private Network wifiNetwork;
     private boolean sensorRegistered = false;
 
     private EditText ipInput;
@@ -86,13 +91,16 @@ public class MainActivity extends Activity implements SensorEventListener {
     private ScheduledExecutorService sender;
     private final AtomicBoolean sendErrorShown = new AtomicBoolean(false);
     private volatile long packetsSent = 0;
+    private volatile long sendAttempts = 0;
+    private volatile String lastSendError = "";
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Runnable uiUpdater = new Runnable() {
         @Override public void run() {
             yawText.setText(String.format(Locale.US, "Yaw  %+.1f°", sentYaw));
             pitchText.setText(String.format(Locale.US, "Pitch  %+.1f°", sentPitch));
             rollText.setText(String.format(Locale.US, "Roll  %+.1f°", sentRoll));
-            packetText.setText("Packets sent: " + packetsSent);
+            String detail = lastSendError.isEmpty() ? "" : "\nآخر خطأ: " + lastSendError;
+            packetText.setText("Packets sent: " + packetsSent + " / Attempts: " + sendAttempts + detail);
             mainHandler.postDelayed(this, 120);
         }
     };
@@ -104,6 +112,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         getWindow().setNavigationBarColor(Color.rgb(11, 17, 24));
 
         sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+        connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         buildInterface();
         loadPreferences();
@@ -441,14 +450,30 @@ public class MainActivity extends Activity implements SensorEventListener {
         stopSenderOnly();
         try {
             socket = new DatagramSocket();
-            socket.setSoTimeout(1000);
+            wifiNetwork = findWifiNetwork();
+            if (wifiNetwork == null) {
+                socket.close();
+                socket = null;
+                setStatus("لم يتم العثور على شبكة Wi-Fi متصلة. وصل الموبايل بنفس شبكة الكمبيوتر.", true);
+                return;
+            }
+            // Force UDP traffic through Wi-Fi, even when mobile data is enabled.
+            wifiNetwork.bindSocket(socket);
         } catch (Exception e) {
-            setStatus("تعذر فتح اتصال الشبكة: " + e.getMessage(), true);
+            if (socket != null) {
+                socket.close();
+                socket = null;
+            }
+            wifiNetwork = null;
+            setStatus("تعذر تجهيز اتصال Wi-Fi: " + e.getClass().getSimpleName()
+                    + (e.getMessage() == null ? "" : " — " + e.getMessage()), true);
             return;
         }
 
         tracking = true;
         packetsSent = 0;
+        sendAttempts = 0;
+        lastSendError = "";
         sentYaw = sentPitch = sentRoll = 0;
         sendErrorShown.set(false);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -457,8 +482,27 @@ public class MainActivity extends Activity implements SensorEventListener {
             sensorRegistered = true;
         }
         sender = Executors.newSingleThreadScheduledExecutor();
-        sender.scheduleAtFixedRate(this::sendLatestPose, 0, 16, TimeUnit.MILLISECONDS);
-        setStatus("●  متصل — جاري إرسال الحركة", false);
+        sender.scheduleAtFixedRate(() -> {
+            try {
+                sendLatestPose();
+            } catch (Throwable t) {
+                lastSendError = t.getClass().getSimpleName()
+                        + (t.getMessage() == null ? "" : ": " + t.getMessage());
+                mainHandler.post(() -> setStatus("توقف مرسل UDP: " + lastSendError, true));
+            }
+        }, 0, 16, TimeUnit.MILLISECONDS);
+        setStatus("●  إرسال عبر Wi-Fi إلى " + destination.getHostAddress() + ":" + destinationPort, false);
+    }
+
+    private Network findWifiNetwork() {
+        if (connectivityManager == null) return null;
+        for (Network network : connectivityManager.getAllNetworks()) {
+            NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(network);
+            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                return network;
+            }
+        }
+        return null;
     }
 
     private void stopTracking(String message) {
@@ -482,10 +526,12 @@ public class MainActivity extends Activity implements SensorEventListener {
             socket.close();
             socket = null;
         }
+        wifiNetwork = null;
     }
 
     private void sendLatestPose() {
         if (!tracking || socket == null || destination == null) return;
+        sendAttempts++;
         double yaw = normalize(rawYaw - centerYaw) * sensitivity * (invertYaw ? -1.0 : 1.0);
         double pitch = normalize(rawPitch - centerPitch) * sensitivity * (invertPitch ? -1.0 : 1.0);
         double roll = normalize(rawRoll - centerRoll) * sensitivity;
@@ -507,9 +553,13 @@ public class MainActivity extends Activity implements SensorEventListener {
             DatagramPacket packet = new DatagramPacket(bytes, bytes.length, destination, destinationPort);
             socket.send(packet);
             packetsSent++;
+            lastSendError = "";
         } catch (Exception e) {
+            lastSendError = e.getClass().getSimpleName()
+                    + (e.getMessage() == null ? "" : ": " + e.getMessage());
             if (sendErrorShown.compareAndSet(false, true)) {
-                mainHandler.post(() -> setStatus("تعذر الإرسال — راجع الشبكة والجدار الناري", true));
+                String detail = lastSendError;
+                mainHandler.post(() -> setStatus("فشل إرسال UDP: " + detail, true));
             }
         }
     }
