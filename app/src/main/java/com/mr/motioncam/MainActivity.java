@@ -13,11 +13,15 @@ import android.hardware.SensorManager;
 import android.net.ConnectivityManager;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
+import android.net.wifi.WifiManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.Process;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
@@ -38,9 +42,6 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Locale;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -51,12 +52,19 @@ public class MainActivity extends Activity implements SensorEventListener {
     private static final String PREFS = "mr_motion_cam";
     private static final int DEFAULT_PORT = 4242;
     private static final int PACKET_BYTES = 48;
+    /** 100 Hz sensor sampling; every sample is sent immediately (no resampling = no stair-stepping). */
+    private static final int SAMPLE_PERIOD_US = 10_000;
 
     private SensorManager sensorManager;
     private Sensor rotationSensor;
     private ConnectivityManager connectivityManager;
     private Network wifiNetwork;
     private boolean sensorRegistered = false;
+    private boolean usingGameVector = false;
+    private HandlerThread sensorThread;
+    private Handler sensorHandler;
+    private WifiManager.WifiLock wifiLock;
+    private TextView modeText;
 
     private EditText ipInput;
     private EditText portInput;
@@ -75,26 +83,15 @@ public class MainActivity extends Activity implements SensorEventListener {
     private Button startButton;
     private Button stopButton;
 
-    private volatile double rawYaw;
-    private volatile double rawPitch;
-    private volatile double rawRoll;
-    private volatile double centerYaw;
-    private volatile double centerPitch;
-    private volatile double centerRoll;
-    private volatile double sentYaw;
-    private volatile double sentPitch;
-    private volatile double sentRoll;
+    private final PosePipeline pipeline = new PosePipeline();
+    private final ByteBuffer packetBuffer = ByteBuffer.allocate(PACKET_BYTES).order(ByteOrder.LITTLE_ENDIAN);
 
-    private volatile double sensitivity = 1.0;
-    private volatile int smoothing = 25;
-    private volatile boolean invertYaw = false;
-    private volatile boolean invertPitch = false;
     private volatile boolean tracking = false;
 
-    private DatagramSocket socket;
-    private InetAddress destination;
-    private int destinationPort = DEFAULT_PORT;
-    private ScheduledExecutorService sender;
+    private volatile DatagramSocket socket;
+    private volatile DatagramPacket outPacket;
+    private volatile InetAddress destination;
+    private volatile int destinationPort = DEFAULT_PORT;
     private final AtomicBoolean sendErrorShown = new AtomicBoolean(false);
     private volatile long packetsSent = 0;
     private volatile long sendAttempts = 0;
@@ -103,9 +100,11 @@ public class MainActivity extends Activity implements SensorEventListener {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Runnable uiUpdater = new Runnable() {
         @Override public void run() {
-            yawText.setText(String.format(Locale.US, "Yaw  %+.1f°", sentYaw));
-            pitchText.setText(String.format(Locale.US, "Pitch  %+.1f°", sentPitch));
-            rollText.setText(String.format(Locale.US, "Roll  %+.1f°", sentRoll));
+            yawText.setText(String.format(Locale.US, "Yaw  %+.1f°", pipeline.yaw));
+            pitchText.setText(String.format(Locale.US, "Pitch  %+.1f°", pipeline.pitch));
+            rollText.setText(String.format(Locale.US, "Roll  %+.1f°", pipeline.roll));
+            modeText.setText((usingGameVector ? "المستشعر: Game Rotation (جيروسكوب بدون بوصلة)" : "المستشعر: Rotation Vector (بالبوصلة)")
+                    + (tracking ? (pipeline.isFlatMode() ? "\nوضع الموبايل: مفرود" : "\nوضع الموبايل: واقف") + " (تلقائي)" : ""));
             String detail = lastSendError.isEmpty() ? "" : "\nآخر خطأ: " + lastSendError;
             packetText.setText("Packets sent: " + packetsSent + " / Attempts: " + sendAttempts
                     + " / Sensor: " + sensorEvents + detail);
@@ -121,7 +120,14 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        // Game rotation vector = gyroscope + accelerometer only (no magnetometer): no magnetic noise or jumps.
+        rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
+        usingGameVector = rotationSensor != null;
+        if (rotationSensor == null) rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        // Sensor callbacks run on their own thread so UI work can never delay a sample.
+        sensorThread = new HandlerThread("mr-sensor", Process.THREAD_PRIORITY_DISPLAY);
+        sensorThread.start();
+        sensorHandler = new Handler(sensorThread.getLooper());
         buildInterface();
         loadPreferences();
         updateSensorAvailability();
@@ -271,6 +277,12 @@ public class MainActivity extends Activity implements SensorEventListener {
         movementCard.addView(pitchText);
         movementCard.addView(rollText);
 
+        modeText = new TextView(this);
+        modeText.setTextColor(muted);
+        modeText.setTextSize(11);
+        modeText.setPadding(0, dp(4), 0, 0);
+        movementCard.addView(modeText);
+
         Button centerButton = new Button(this);
         centerButton.setText("إعادة ضبط المنتصف  ⊙");
         centerButton.setAllCaps(false);
@@ -302,8 +314,8 @@ public class MainActivity extends Activity implements SensorEventListener {
         settingsCard.addView(sensitivityBar);
         sensitivityBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                sensitivity = 0.1 * (progress + 1);
-                sensitivityValue.setText(String.format(Locale.US, "%.1fx", sensitivity));
+                pipeline.sensitivity = 0.1 * (progress + 1);
+                sensitivityValue.setText(String.format(Locale.US, "%.1fx", pipeline.sensitivity));
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) { }
             @Override public void onStopTrackingTouch(SeekBar seekBar) { }
@@ -325,7 +337,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         settingsCard.addView(smoothingBar);
         smoothingBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                smoothing = progress;
+                pipeline.minCutoffHz = PosePipeline.cutoffForSmoothing(progress);
                 smoothingValue.setText(progress + "%");
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) { }
@@ -338,8 +350,8 @@ public class MainActivity extends Activity implements SensorEventListener {
         switchLp1.topMargin = dp(10);
         settingsCard.addView(invertYawSwitch, switchLp1);
         settingsCard.addView(invertPitchSwitch, params(-1, -2));
-        invertYawSwitch.setOnCheckedChangeListener((buttonView, checked) -> invertYaw = checked);
-        invertPitchSwitch.setOnCheckedChangeListener((buttonView, checked) -> invertPitch = checked);
+        invertYawSwitch.setOnCheckedChangeListener((buttonView, checked) -> pipeline.invertYaw = checked);
+        invertPitchSwitch.setOnCheckedChangeListener((buttonView, checked) -> pipeline.invertPitch = checked);
 
         TextView footer = new TextView(this);
         footer.setText("مهم: الموبايل والكمبيوتر لازم يكونوا على نفس شبكة Wi‑Fi. التطبيق يرسل زوايا الدوران فقط. الإرسال UDP بدون تأكيد استلام، فالتطبيق مش بيعرف لو الكمبيوتر استلم — راجع الأرقام في OpenTrack.");
@@ -505,28 +517,20 @@ public class MainActivity extends Activity implements SensorEventListener {
             return;
         }
 
-        tracking = true;
         packetsSent = 0;
         sendAttempts = 0;
         sensorEvents = 0;
         lastSendError = "";
-        sentYaw = sentPitch = sentRoll = 0;
         sendErrorShown.set(false);
+        outPacket = new DatagramPacket(packetBuffer.array(), PACKET_BYTES, destination, destinationPort);
+        try {
+            socket.setTrafficClass(0xB8); // ask the network for low-delay treatment (best effort)
+        } catch (Exception ignored) { }
+        pipeline.restart(); // first sample after start becomes the neutral pose
+        acquireWifiLock();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        if (!sensorRegistered) {
-            sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_GAME);
-            sensorRegistered = true;
-        }
-        sender = Executors.newSingleThreadScheduledExecutor();
-        sender.scheduleAtFixedRate(() -> {
-            try {
-                sendLatestPose();
-            } catch (Throwable t) {
-                lastSendError = t.getClass().getSimpleName()
-                        + (t.getMessage() == null ? "" : ": " + t.getMessage());
-                mainHandler.post(() -> setStatus("توقف مرسل UDP: " + lastSendError, true));
-            }
-        }, 0, 16, TimeUnit.MILLISECONDS);
+        tracking = true;
+        registerSensor();
         setStatus("●  إرسال " + route + " إلى " + destination.getHostAddress() + ":" + destinationPort, false);
         refreshNetworkInfo();
     }
@@ -635,53 +639,95 @@ public class MainActivity extends Activity implements SensorEventListener {
         return out;
     }
 
-    private void stopTracking(String message) {
-        tracking = false;
-        stopSenderOnly();
-        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    private void registerSensor() {
+        if (sensorRegistered || rotationSensor == null || sensorHandler == null) return;
+        sensorRegistered = sensorManager.registerListener(this, rotationSensor, SAMPLE_PERIOD_US, sensorHandler);
+        if (!sensorRegistered) setStatus("تعذر تشغيل المستشعر", true);
+    }
+
+    private void unregisterSensor() {
         if (sensorRegistered) {
             sensorManager.unregisterListener(this);
             sensorRegistered = false;
         }
+    }
+
+    /** Stops Wi-Fi power saving from batching packets (the usual cause of periodic stutter). */
+    @SuppressWarnings("deprecation")
+    private void acquireWifiLock() {
+        try {
+            if (wifiLock == null) {
+                WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wm == null) return;
+                int mode = Build.VERSION.SDK_INT >= 29
+                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                        : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                wifiLock = wm.createWifiLock(mode, "MRMotionCam");
+                wifiLock.setReferenceCounted(false);
+            }
+            if (!wifiLock.isHeld()) wifiLock.acquire();
+        } catch (Throwable ignored) { }
+    }
+
+    private void releaseWifiLock() {
+        try {
+            if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        } catch (Throwable ignored) { }
+    }
+
+    private void stopTracking(String message) {
+        tracking = false;
+        unregisterSensor();
+        stopSenderOnly();
+        releaseWifiLock();
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setStatus("●  " + message, false);
         savePreferences();
     }
 
     private void stopSenderOnly() {
-        if (sender != null) {
-            sender.shutdownNow();
-            sender = null;
-        }
-        if (socket != null) {
-            socket.close();
-            socket = null;
-        }
+        outPacket = null;
+        DatagramSocket s = socket;
+        socket = null;
+        if (s != null) s.close();
         wifiNetwork = null;
     }
 
-    private void sendLatestPose() {
-        if (!tracking || socket == null || destination == null) return;
+    private void recenter() {
+        if (!tracking) {
+            setStatus("ابدأ التتبع الأول، وبعدين اضغط إعادة ضبط المنتصف وإنت ماسك الموبايل في الوضع المريح", true);
+            return;
+        }
+        pipeline.requestCenter();
+        setStatus("تم ضبط المنتصف", false);
+    }
+
+    private void setStatus(String message, boolean error) {
+        statusText.setText(message);
+        statusText.setTextColor(error ? Color.rgb(255, 173, 95) : Color.rgb(53, 197, 180));
+    }
+
+    /** Runs on the sensor thread: one sensor sample in, one UDP packet out, nothing in between. */
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        int type = event.sensor.getType();
+        if (type != Sensor.TYPE_GAME_ROTATION_VECTOR && type != Sensor.TYPE_ROTATION_VECTOR) return;
+        sensorEvents++;
+        DatagramSocket out = socket;
+        DatagramPacket packet = outPacket;
+        if (!tracking || out == null || packet == null) return;
+        if (!pipeline.process(event.values, event.timestamp)) return;
+
         sendAttempts++;
-        double yaw = normalize(rawYaw - centerYaw) * sensitivity * (invertYaw ? -1.0 : 1.0);
-        double pitch = normalize(rawPitch - centerPitch) * sensitivity * (invertPitch ? -1.0 : 1.0);
-        double roll = normalize(rawRoll - centerRoll) * sensitivity;
-
-        double alpha = 1.0 - (smoothing / 100.0) * 0.85;
-        sentYaw += (yaw - sentYaw) * alpha;
-        sentPitch += (pitch - sentPitch) * alpha;
-        sentRoll += (roll - sentRoll) * alpha;
-
-        ByteBuffer buffer = ByteBuffer.allocate(PACKET_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-        buffer.putDouble(0.0); // X translation in cm (rotation-only tracker)
-        buffer.putDouble(0.0); // Y translation in cm
-        buffer.putDouble(0.0); // Z translation in cm
-        buffer.putDouble(sentYaw);
-        buffer.putDouble(sentPitch);
-        buffer.putDouble(sentRoll);
-        byte[] bytes = buffer.array();
+        packetBuffer.clear();
+        packetBuffer.putDouble(0.0); // X translation in cm (rotation-only tracker)
+        packetBuffer.putDouble(0.0); // Y
+        packetBuffer.putDouble(0.0); // Z
+        packetBuffer.putDouble(pipeline.yaw);
+        packetBuffer.putDouble(pipeline.pitch);
+        packetBuffer.putDouble(pipeline.roll);
         try {
-            DatagramPacket packet = new DatagramPacket(bytes, bytes.length, destination, destinationPort);
-            socket.send(packet);
+            out.send(packet);
             packetsSent++;
             lastSendError = "";
         } catch (Exception e) {
@@ -694,56 +740,18 @@ public class MainActivity extends Activity implements SensorEventListener {
         }
     }
 
-    private void recenter() {
-        centerYaw = rawYaw;
-        centerPitch = rawPitch;
-        centerRoll = rawRoll;
-        sentYaw = sentPitch = sentRoll = 0;
-        setStatus(tracking ? "تم ضبط المنتصف" : "تم حفظ وضع المنتصف الحالي", false);
-    }
-
-    private double normalize(double degrees) {
-        while (degrees > 180.0) degrees -= 360.0;
-        while (degrees < -180.0) degrees += 360.0;
-        return degrees;
-    }
-
-    private void setStatus(String message, boolean error) {
-        statusText.setText(message);
-        statusText.setTextColor(error ? Color.rgb(255, 173, 95) : Color.rgb(53, 197, 180));
-    }
-
-    @Override
-    public void onSensorChanged(SensorEvent event) {
-        if (event.sensor.getType() != Sensor.TYPE_ROTATION_VECTOR) return;
-        sensorEvents++;
-        float[] rotationMatrix = new float[9];
-        float[] orientation = new float[3];
-        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
-        SensorManager.getOrientation(rotationMatrix, orientation);
-        rawYaw = Math.toDegrees(orientation[0]);
-        rawPitch = Math.toDegrees(orientation[1]);
-        rawRoll = Math.toDegrees(orientation[2]);
-    }
-
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }
 
     @Override
     protected void onResume() {
         super.onResume();
         refreshNetworkInfo();
-        if (tracking && rotationSensor != null && !sensorRegistered) {
-            sensorManager.registerListener(this, rotationSensor, SensorManager.SENSOR_DELAY_GAME);
-            sensorRegistered = true;
-        }
+        if (tracking) registerSensor();
     }
 
     @Override
     protected void onPause() {
-        if (sensorRegistered) {
-            sensorManager.unregisterListener(this);
-            sensorRegistered = false;
-        }
+        unregisterSensor();
         super.onPause();
     }
 
@@ -751,6 +759,10 @@ public class MainActivity extends Activity implements SensorEventListener {
     protected void onDestroy() {
         stopTracking("تم إيقاف التتبع");
         mainHandler.removeCallbacks(uiUpdater);
+        if (sensorThread != null) {
+            sensorThread.quitSafely();
+            sensorThread = null;
+        }
         super.onDestroy();
     }
 
@@ -766,12 +778,12 @@ public class MainActivity extends Activity implements SensorEventListener {
         smoothingBar.setProgress(smoothProgress);
         invertYawSwitch.setChecked(iy);
         invertPitchSwitch.setChecked(ip);
-        sensitivity = 0.1 * (sensitivityBar.getProgress() + 1);
-        smoothing = smoothingBar.getProgress();
-        invertYaw = iy;
-        invertPitch = ip;
-        sensitivityValue.setText(String.format(Locale.US, "%.1fx", sensitivity));
-        smoothingValue.setText(smoothing + "%");
+        pipeline.sensitivity = 0.1 * (sensitivityBar.getProgress() + 1);
+        pipeline.minCutoffHz = PosePipeline.cutoffForSmoothing(smoothingBar.getProgress());
+        pipeline.invertYaw = iy;
+        pipeline.invertPitch = ip;
+        sensitivityValue.setText(String.format(Locale.US, "%.1fx", pipeline.sensitivity));
+        smoothingValue.setText(smoothingBar.getProgress() + "%");
     }
 
     private void savePreferences() {
