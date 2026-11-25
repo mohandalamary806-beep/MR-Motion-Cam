@@ -1,8 +1,11 @@
 package com.mr.motioncam;
 
 import android.app.Activity;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -15,33 +18,52 @@ import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.wifi.WifiManager;
 import android.net.Network;
+import android.net.Uri;
 import android.net.NetworkCapabilities;
 import android.os.Bundle;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.os.Process;
+import android.os.SystemClock;
+import android.provider.MediaStore;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -52,6 +74,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private static final String PREFS = "mr_motion_cam";
     private static final int DEFAULT_PORT = 4242;
     private static final int PACKET_BYTES = 48;
+    private static final int DEFAULT_STREAM_PORT = 8088;
     /** 100 Hz sensor sampling; every sample is sent immediately (no resampling = no stair-stepping). */
     private static final int SAMPLE_PERIOD_US = 10_000;
 
@@ -65,6 +88,35 @@ public class MainActivity extends Activity implements SensorEventListener {
     private Handler sensorHandler;
     private WifiManager.WifiLock wifiLock;
     private TextView modeText;
+
+    // PC Hub: buttons (UDP, port = pose port + 1) and live view (HTTP MJPEG)
+    private ControlClient control;
+    private TextView hubText;
+    private EditText pinInput;
+    private Switch cameraSwitch;
+    private long lastPauseSyncMs;
+    private ImageView liveImage;
+    private TextView liveText;
+    private Button liveButton;
+    private Button recordButton;
+    private MjpegClient liveClient;
+    private volatile String liveStatus = "";
+    private volatile long liveFrames;
+    private final AtomicBoolean framePending = new AtomicBoolean(false);
+    private final Bitmap[] liveBuffers = new Bitmap[2]; // only touched by the stream thread
+    private int liveBufferIndex;
+    private volatile boolean recording;
+    private ExecutorService recorderExec;               // UI thread owns the reference
+    private MjpegAviWriter recorderWriter;              // the fields below: recorder thread only
+    private ParcelFileDescriptor recorderPfd;
+    private FileOutputStream recorderOut;
+    private RandomAccessFile recorderRaf;
+    private Uri recorderUri;
+    private String recorderName = "";
+    private String recorderLocation = "";
+    private volatile long recordedFrames;
+    private volatile long recordedBytes;
+    private volatile String recordResult = "";
 
     private EditText ipInput;
     private EditText portInput;
@@ -108,6 +160,8 @@ public class MainActivity extends Activity implements SensorEventListener {
             String detail = lastSendError.isEmpty() ? "" : "\nآخر خطأ: " + lastSendError;
             packetText.setText("Packets sent: " + packetsSent + " / Attempts: " + sendAttempts
                     + " / Sensor: " + sensorEvents + detail);
+            updateHubStatus();
+            updateLiveStatus();
             mainHandler.postDelayed(this, 120);
         }
     };
@@ -235,6 +289,22 @@ public class MainActivity extends Activity implements SensorEventListener {
         portLp.topMargin = dp(7);
         connectionCard.addView(portInput, portLp);
 
+        TextView pinLabel = smallLabel("رمز الأمان (اختياري) — لازم يطابق -Pin في الـ Hub", muted);
+        LinearLayout.LayoutParams pinLabelLp = params(-1, -2);
+        pinLabelLp.topMargin = dp(12);
+        connectionCard.addView(pinLabel, pinLabelLp);
+        pinInput = new EditText(this);
+        pinInput.setSingleLine(true);
+        pinInput.setTextColor(text);
+        pinInput.setHintTextColor(Color.rgb(102, 119, 133));
+        pinInput.setHint("سيبه فاضي لو الـ Hub من غير PIN");
+        pinInput.setTextSize(15);
+        pinInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        styleInput(pinInput, bg);
+        LinearLayout.LayoutParams pinLp = params(-1, dp(48));
+        pinLp.topMargin = dp(7);
+        connectionCard.addView(pinInput, pinLp);
+
         LinearLayout buttons = new LinearLayout(this);
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         buttons.setGravity(Gravity.CENTER_VERTICAL);
@@ -293,6 +363,9 @@ public class MainActivity extends Activity implements SensorEventListener {
         centerLp.topMargin = dp(14);
         movementCard.addView(centerButton, centerLp);
         centerButton.setOnClickListener(v -> recenter());
+
+        buildControlCard(page, panel, text, muted, accent);
+        buildLiveCard(page, panel, text, muted, accent);
 
         addSectionTitle(page, "تخصيص الحركة", text);
         LinearLayout settingsCard = card(panel);
@@ -531,6 +604,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         tracking = true;
         registerSensor();
+        startControl();
         setStatus("●  إرسال " + route + " إلى " + destination.getHostAddress() + ":" + destinationPort, false);
         refreshNetworkInfo();
     }
@@ -677,6 +751,7 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private void stopTracking(String message) {
         tracking = false;
+        stopControl();
         unregisterSensor();
         stopSenderOnly();
         releaseWifiLock();
@@ -719,7 +794,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (!pipeline.process(event.values, event.timestamp)) return;
 
         sendAttempts++;
-        packetBuffer.clear();
+        ((java.nio.Buffer) packetBuffer).clear(); // cast: ByteBuffer.clear() has a different signature on Android < 13
         packetBuffer.putDouble(0.0); // X translation in cm (rotation-only tracker)
         packetBuffer.putDouble(0.0); // Y
         packetBuffer.putDouble(0.0); // Z
@@ -740,6 +815,403 @@ public class MainActivity extends Activity implements SensorEventListener {
         }
     }
 
+
+    // ======================================================================================================
+    // PC Hub: control buttons
+    // ======================================================================================================
+
+    private void startControl() {
+        stopControl();
+        try {
+            DatagramSocket controlSocket = new DatagramSocket();
+            if (wifiNetwork != null) wifiNetwork.bindSocket(controlSocket);
+            control = new ControlClient(controlSocket, destination, destinationPort + 1, pinInput.getText().toString());
+            control.start();
+            lastPauseSyncMs = 0;
+        } catch (Exception e) {
+            control = null;
+        }
+    }
+
+    private void stopControl() {
+        ControlClient c = control;
+        control = null;
+        if (c != null) c.stop();
+    }
+
+    private void controlAct(String action, boolean down) {
+        ControlClient c = control;
+        if (c == null) {
+            if (down) setStatus("ابدأ التتبع الأول عشان أزرار التحكم تشتغل", true);
+            return;
+        }
+        c.act(action, down);
+    }
+
+    private void updateHubStatus() {
+        if (hubText == null) return;
+        ControlClient c = control;
+        if (c == null) {
+            hubText.setText("الـ Hub: دوس \"ابدأ التتبع\" الأول عشان الأزرار تشتغل");
+            hubText.setTextColor(Color.rgb(151, 167, 180));
+            return;
+        }
+        if (c.isConnected()) {
+            String cam = !c.hubCamera ? "من OpenTrack" : (c.hubPaused ? "من الـ Hub (موقوفة)" : "من الـ Hub (شغالة)");
+            String ack = c.lastAck.isEmpty() ? "" : "\nآخر أمر: " + c.lastAck
+                    + (c.lastAck.endsWith("unknown") ? "  ⚠ مش موجود في ملف البروفايل" : "");
+            hubText.setText("✔ الـ Hub متصل (" + c.profile + ") — الكاميرا " + cam + ack);
+            hubText.setTextColor(Color.rgb(53, 197, 180));
+            // keep the Hub's pause state equal to the switch (also after the Hub was restarted)
+            boolean wantPaused = !cameraSwitch.isChecked();
+            long now = SystemClock.elapsedRealtime();
+            if (c.hubCamera && c.hubPaused != wantPaused && now - lastPauseSyncMs > 1500) {
+                lastPauseSyncMs = now;
+                c.setPaused(wantPaused);
+            }
+        } else {
+            hubText.setText("الـ Hub مش متصل. شغّل HUB_BUTTONS_ONLY.bat أو HUB_WITH_CAMERA.bat على الكمبيوتر."
+                    + " مش لازم لو بتستخدم OpenTrack بس.");
+            hubText.setTextColor(Color.rgb(255, 173, 95));
+        }
+    }
+
+    private void buildControlCard(LinearLayout page, int panel, int text, int muted, int accent) {
+        addSectionTitle(page, "التحكم في اللعبة", text);
+        LinearLayout box = card(panel);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(14), dp(16), dp(16));
+        page.addView(box, params(-1, -2));
+
+        hubText = new TextView(this);
+        hubText.setTextColor(muted);
+        hubText.setTextSize(12);
+        box.addView(hubText);
+
+        cameraSwitch = makeSwitch("تتبع الكاميرا شغال (بيوقفه مؤقتًا في الـ Hub)", text);
+        cameraSwitch.setChecked(true);
+        LinearLayout.LayoutParams swLp = params(-1, -2);
+        swLp.topMargin = dp(8);
+        box.addView(cameraSwitch, swLp);
+        cameraSwitch.setOnCheckedChangeListener((b, checked) -> {
+            ControlClient c = control;
+            if (c != null && c.hubCamera) c.setPaused(!checked);
+        });
+
+        // {label, action name in windows/profile_cpm2.ini}. "اضغط" = the key stays pressed while you hold the button.
+        String[][] items = {
+                {"🔑  المحرك", "engine"}, {"📯  هورن (اضغط)", "horn"},
+                {"🅿  فرامل اليد", "handbrake"}, {"📷  كاميرا", "camera"},
+                {"🎥  كاميرا حرة (اضغط)", "freecam"}, {"🚪  أبواب (اضغط)", "doors"},
+                {"☰  قائمة Tab (اضغط)", "radial"}, {"🚁  درون (اضغط)", "drone"},
+                {"▲  عجلة", "wheel_up"}, {"▼  عجلة", "wheel_down"},
+                {"🔍＋  زوم", "zoom_in"}, {"🔍－  زوم", "zoom_out"},
+                {"🖱  كليك", "click"},
+        };
+        for (int i = 0; i < items.length; i += 2) {
+            LinearLayout line = row();
+            LinearLayout.LayoutParams lineLp = params(-1, dp(50));
+            lineLp.topMargin = dp(8);
+            box.addView(line, lineLp);
+            for (int k = 0; k < 2; k++) {
+                LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(0, -1, 1);
+                if (k == 1) bl.leftMargin = dp(8);
+                if (i + k < items.length) line.addView(actionButton(items[i + k][0], items[i + k][1], text, accent), bl);
+                else line.addView(new View(this), bl);
+            }
+        }
+    }
+
+    private Button actionButton(String label, final String action, int text, final int accent) {
+        final Button b = new Button(this);
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setTextColor(text);
+        b.setTextSize(13);
+        final GradientDrawable idle = round(Color.rgb(42, 59, 71), 13);
+        final GradientDrawable pressed = round(accent, 13);
+        b.setBackground(idle);
+        b.setOnTouchListener((v, ev) -> {
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    v.getParent().requestDisallowInterceptTouchEvent(true);
+                    b.setBackground(pressed);
+                    b.setTextColor(Color.rgb(5, 24, 25));
+                    v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                    controlAct(action, true);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    b.setBackground(idle);
+                    b.setTextColor(Color.WHITE);
+                    controlAct(action, false);
+                    return true;
+                default:
+                    return true;
+            }
+        });
+        return b;
+    }
+
+    // ======================================================================================================
+    // PC Hub: live view and recording
+    // ======================================================================================================
+
+    private void buildLiveCard(LinearLayout page, int panel, int text, int muted, int accent) {
+        addSectionTitle(page, "بث اللعبة (Live View)", text);
+        LinearLayout box = card(panel);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(14), dp(16), dp(16));
+        page.addView(box, params(-1, -2));
+
+        liveImage = new ImageView(this);
+        liveImage.setBackgroundColor(Color.BLACK);
+        liveImage.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        box.addView(liveImage, params(-1, dp(210)));
+
+        liveText = new TextView(this);
+        liveText.setTextColor(muted);
+        liveText.setTextSize(12);
+        liveText.setPadding(0, dp(8), 0, 0);
+        box.addView(liveText);
+
+        LinearLayout line = row();
+        LinearLayout.LayoutParams lineLp = params(-1, dp(48));
+        lineLp.topMargin = dp(10);
+        box.addView(line, lineLp);
+
+        liveButton = new Button(this);
+        liveButton.setText("بث اللعبة ▶");
+        liveButton.setAllCaps(false);
+        liveButton.setTextColor(Color.rgb(5, 24, 25));
+        liveButton.setTextSize(14);
+        liveButton.setBackground(round(accent, 13));
+        line.addView(liveButton, new LinearLayout.LayoutParams(0, -1, 1));
+
+        recordButton = new Button(this);
+        recordButton.setText("تسجيل ●");
+        recordButton.setAllCaps(false);
+        recordButton.setTextColor(text);
+        recordButton.setTextSize(14);
+        recordButton.setBackground(round(Color.rgb(54, 67, 80), 13));
+        LinearLayout.LayoutParams recLp = new LinearLayout.LayoutParams(0, -1, 1);
+        recLp.leftMargin = dp(9);
+        line.addView(recordButton, recLp);
+
+        liveButton.setOnClickListener(v -> {
+            if (liveClient != null) stopLive();
+            else startLive();
+        });
+        recordButton.setOnClickListener(v -> {
+            if (recording) stopRecording();
+            else startRecording();
+        });
+    }
+
+    private final MjpegClient.Listener liveListener = new MjpegClient.Listener() {
+        @Override public void onFrame(byte[] jpeg) {
+            liveFrames++;
+            if (recording) feedRecorder(jpeg);
+            if (!framePending.compareAndSet(false, true)) return; // the screen is still busy: skip showing, never skip recording
+            final Bitmap bmp = decodeFrame(jpeg);
+            if (bmp == null) {
+                framePending.set(false);
+                return;
+            }
+            mainHandler.post(() -> {
+                if (liveClient != null) liveImage.setImageBitmap(bmp);
+                framePending.set(false);
+            });
+        }
+
+        @Override public void onStatus(String status) {
+            liveStatus = status;
+        }
+    };
+
+    /** Decodes into one of two reusable bitmaps (never into the one currently on screen) to avoid GC churn. */
+    private Bitmap decodeFrame(byte[] jpeg) {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inMutable = true;
+            o.inBitmap = liveBuffers[liveBufferIndex];
+            Bitmap b;
+            try {
+                b = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, o);
+            } catch (IllegalArgumentException sizeChanged) {
+                o.inBitmap = null;
+                b = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.length, o);
+            }
+            if (b != null) {
+                liveBuffers[liveBufferIndex] = b;
+                liveBufferIndex ^= 1;
+            }
+            return b;
+        } catch (OutOfMemoryError e) {
+            return null;
+        }
+    }
+
+    private void startLive() {
+        String host = cleanIp(ipInput.getText().toString());
+        if (parseIpv4(host) == null) {
+            ipInput.setError("اكتب IP الكمبيوتر الأول");
+            return;
+        }
+        ControlClient c = control;
+        int port = (c != null && c.streamPort > 0) ? c.streamPort : DEFAULT_STREAM_PORT;
+        final Network net = findLanNetwork();
+        URL url;
+        try {
+            url = new URL("http://" + host + ":" + port + "/stream");
+        } catch (Exception e) {
+            return;
+        }
+        liveFrames = 0;
+        liveStatus = "connecting";
+        framePending.set(false);
+        liveClient = new MjpegClient(url, u -> net != null ? net.openConnection(u) : u.openConnection(), liveListener);
+        liveClient.start();
+        liveButton.setText("إيقاف البث ■");
+    }
+
+    private void stopLive() {
+        if (liveButton == null) return;
+        stopRecording();
+        MjpegClient c = liveClient;
+        liveClient = null;
+        if (c != null) c.stop();
+        liveButton.setText("بث اللعبة ▶");
+        liveImage.setImageDrawable(null);
+        framePending.set(false);
+    }
+
+    private void updateLiveStatus() {
+        if (liveText == null) return;
+        if (!recording && recorderExec != null) stopRecording(); // the recorder thread gave up (error): finish cleanly
+        StringBuilder sb = new StringBuilder();
+        if (liveClient == null) {
+            sb.append("البث واقف. شغّل الـ Hub على الكمبيوتر وبعدين دوس \"بث اللعبة\". ")
+              .append("ولو الشاشة سودا: اللعبة لازم تكون Windowed أو Borderless.");
+        } else {
+            sb.append("البث: ").append(liveStatus).append(" — ").append(liveFrames).append(" فريم");
+        }
+        if (recording) {
+            sb.append("\n● بيسجّل: ").append(recordedFrames).append(" فريم، ")
+              .append(String.format(Locale.US, "%.1f MB", recordedBytes / 1048576.0));
+        } else if (!recordResult.isEmpty()) {
+            sb.append("\n").append(recordResult);
+        }
+        liveText.setText(sb.toString());
+    }
+
+    private void startRecording() {
+        if (liveClient == null) {
+            recordResult = "شغّل البث الأول وبعدين سجّل";
+            return;
+        }
+        recorderName = "MR_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".avi";
+        recorderExec = Executors.newSingleThreadExecutor();
+        recordedFrames = 0;
+        recordedBytes = 0;
+        recordResult = "";
+        recording = true;
+        recordButton.setText("إيقاف التسجيل ■");
+    }
+
+    private void stopRecording() {
+        recording = false;
+        if (recordButton != null) recordButton.setText("تسجيل ●");
+        final ExecutorService ex = recorderExec;
+        recorderExec = null;
+        if (ex == null) return;
+        try {
+            ex.execute(this::finishRecording); // runs after every queued frame has been written
+        } catch (RejectedExecutionException ignored) { }
+        ex.shutdown();
+    }
+
+    private void feedRecorder(final byte[] jpeg) {
+        final ExecutorService ex = recorderExec;
+        if (ex == null) return;
+        final long now = System.nanoTime();
+        try {
+            ex.execute(() -> writeFrame(jpeg, now));
+        } catch (RejectedExecutionException ignored) { }
+    }
+
+    /** Recorder thread. */
+    private void writeFrame(byte[] jpeg, long nowNanos) {
+        try {
+            if (recorderWriter == null) {
+                int[] size = JpegInfo.dimensions(jpeg);
+                if (size == null) return;
+                recorderWriter = new MjpegAviWriter(openRecordingChannel(recorderName), size[0], size[1]);
+            }
+            recorderWriter.addFrame(jpeg, nowNanos);
+            recordedFrames = recorderWriter.frameCount();
+            recordedBytes = recorderWriter.size();
+        } catch (Exception e) {
+            recordResult = "فشل التسجيل: " + e.getClass().getSimpleName() + (e.getMessage() == null ? "" : " — " + e.getMessage());
+            recording = false;
+        }
+    }
+
+    /** Recorder thread. */
+    private void finishRecording() {
+        String message;
+        try {
+            int frames = recorderWriter == null ? 0 : recorderWriter.frameCount();
+            if (recorderWriter != null) recorderWriter.close();
+            closeRecordingTarget();
+            message = frames == 0 ? "مفيش فريمات اتسجلت"
+                    : "اتحفظ: " + recorderLocation + " (" + frames + " فريم، "
+                      + String.format(Locale.US, "%.1f MB", recordedBytes / 1048576.0) + ")";
+        } catch (Exception e) {
+            message = "فشل إنهاء الملف: " + e.getClass().getSimpleName();
+        }
+        recorderWriter = null;
+        if (recordResult.isEmpty()) recordResult = message;
+    }
+
+    /** Recorder thread. Android 10+: into Movies/MR Motion Cam through MediaStore (no permission needed). */
+    private FileChannel openRecordingChannel(String name) throws IOException {
+        if (Build.VERSION.SDK_INT >= 29) {
+            ContentValues v = new ContentValues();
+            v.put(MediaStore.Video.Media.DISPLAY_NAME, name);
+            v.put(MediaStore.Video.Media.MIME_TYPE, "video/x-msvideo");
+            v.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/MR Motion Cam");
+            v.put(MediaStore.Video.Media.IS_PENDING, 1);
+            recorderUri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
+            if (recorderUri == null) throw new IOException("MediaStore insert failed");
+            recorderPfd = getContentResolver().openFileDescriptor(recorderUri, "rw");
+            if (recorderPfd == null) throw new IOException("cannot open the new file");
+            recorderOut = new FileOutputStream(recorderPfd.getFileDescriptor());
+            recorderLocation = "Movies/MR Motion Cam/" + name;
+            return recorderOut.getChannel();
+        }
+        File dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+        if (dir == null) dir = getFilesDir();
+        File file = new File(dir, name);
+        recorderRaf = new RandomAccessFile(file, "rw");
+        recorderRaf.setLength(0);
+        recorderLocation = file.getAbsolutePath();
+        return recorderRaf.getChannel();
+    }
+
+    /** Recorder thread. */
+    private void closeRecordingTarget() throws IOException {
+        if (recorderOut != null) { recorderOut.close(); recorderOut = null; }
+        if (recorderPfd != null) { recorderPfd.close(); recorderPfd = null; }
+        if (recorderRaf != null) { recorderRaf.close(); recorderRaf = null; }
+        if (recorderUri != null) {
+            ContentValues done = new ContentValues();
+            done.put(MediaStore.Video.Media.IS_PENDING, 0);
+            getContentResolver().update(recorderUri, done, null, null);
+            recorderUri = null;
+        }
+    }
+
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }
 
     @Override
@@ -751,12 +1223,14 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     @Override
     protected void onPause() {
+        stopLive();
         unregisterSensor();
         super.onPause();
     }
 
     @Override
     protected void onDestroy() {
+        stopLive();
         stopTracking("تم إيقاف التتبع");
         mainHandler.removeCallbacks(uiUpdater);
         if (sensorThread != null) {
@@ -770,6 +1244,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
         ipInput.setText(p.getString("ip", ""));
         portInput.setText(p.getString("port", String.valueOf(DEFAULT_PORT)));
+        pinInput.setText(p.getString("pin", ""));
         int sensProgress = p.getInt("sensitivityProgress", 9);
         int smoothProgress = p.getInt("smoothingProgress", 25);
         boolean iy = p.getBoolean("invertYaw", false);
@@ -791,6 +1266,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putString("ip", ipInput.getText().toString().trim())
                 .putString("port", portInput.getText().toString().trim())
+                .putString("pin", pinInput.getText().toString().trim())
                 .putInt("sensitivityProgress", sensitivityBar.getProgress())
                 .putInt("smoothingProgress", smoothingBar.getProgress())
                 .putBoolean("invertYaw", invertYawSwitch.isChecked())
